@@ -75,10 +75,6 @@ runs:
         REPOS_DEPLOYED_EXPR='[.patches[] | select(.target.group=="source.toolkit.fluxcd.io" and .target.version=="v1" and .target.kind=="GitRepository")] | length'
         if [[ "$(yq e "${REPOS_DEPLOYED_EXPR}" "${ENVIRONMENT_KUSTOMIZATION_FILE}")" == "0" ]]; then
           git rm -rfv "${ENVIRONMENT_DIRECTORY}"
-          gh api --method DELETE \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "/repos/arikkfir/${REPOSITORY}/environments/${ENVIRONMENT}"
         fi
         
         # Remove this repository from the list of repositories monitored by the Flux webhook receiver (if it's there)
@@ -91,4 +87,12 @@ runs:
         if [[ -n "$(git status -s --untracked-files=no)" ]]; then
           git commit -m "deploy(${REPOSITORY}): undeploy from \"${ENVIRONMENT}\"" --signoff
           git push origin HEAD
+        fi
+        
+        # If we deleted the environment in Git, delete it in GitHub as well
+        if [[ ! -d "${ENVIRONMENT_DIRECTORY}" ]]; then
+          gh api --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/arikkfir/${REPOSITORY}/environments/${ENVIRONMENT}"
         fi
