@@ -1,0 +1,88 @@
+name: Undeploy
+description: |
+  Undeploy a repository from a given environment in the "delivery" repository. If no other repositories are deployed to
+  the environment, the environment is deleted.
+branding:
+  icon: bookmark
+  color: blue
+
+inputs:
+  repository:
+    description: The repository being deployed
+    required: true
+  branch:
+    description: The branch being deployed in the source repository
+    required: true
+  environment:
+    description: The target environment to deploy to
+    required: true
+  token:
+    description: GitHub token used to clone the "delivery" repository
+    required: true
+
+runs:
+  using: composite
+  steps:
+
+    - uses: actions/checkout@v4
+      with:
+        path: _delivery
+        repository: arikkfir/delivery
+        token: ${{ inputs.token }}
+
+    - id: undeploy
+      shell: bash -exuo pipefail {0}
+      env:
+        BRANCH: ${{ inputs.branch }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        ENVIRONMENT_DIRECTORY: environments/${{ inputs.environment }}
+        ENVIRONMENT_KUSTOMIZATION_FILE: environments/${{ inputs.environment }}/kustomization.yaml
+        ENVIRONMENT_TEMPLATE_FILE: etc/${{ inputs.environment }}/kustomization.yaml
+        REPOSITORY: ${{ inputs.repository }}
+      working-directory: _delivery
+      run: |
+        
+        # Verify inputs
+        [[ -z "${REPOSITORY}" ]] && echo "Missing repository input" && exit 1 
+        [[ -z "${BRANCH}" ]] && echo "Missing branch input" && exit 1
+        [[ -z "${ENVIRONMENT}" ]] && echo "Missing environment input" && exit 1
+        
+        # Ensure repository environment kustomization exists; create it if missing
+        if [[ ! -f "${ENVIRONMENT_KUSTOMIZATION_FILE}" ]]; then
+          mkdir -pv "environments/${ENVIRONMENT}"
+          envsubst < "${ENVIRONMENT_TEMPLATE_FILE}" > "${ENVIRONMENT_KUSTOMIZATION_FILE}"
+        fi
+        
+        # Create a patch file to replace the branch in the GitRepository object associated with the given repository
+        # Then, ensure this patch is NOT included in the environment's kustomization file
+        cat > patches.yaml <<EOF
+        - patch: |
+            - op: replace
+              path: /spec/ref/branch
+              value: "${BRANCH}"
+          target:
+            group: source.toolkit.fluxcd.io
+            version: v1
+            kind: GitRepository
+            name: "${REPOSITORY}"
+        EOF
+        yq e -i '.patches -= load("patches.yaml")' "${ENVIRONMENT_KUSTOMIZATION_FILE}"
+        git add "${ENVIRONMENT_KUSTOMIZATION_FILE}"
+        
+        # If no other repositories are deployed to the environment, delete it entirely
+        REPOS_DEPLOYED_EXPR='[.patches[] | select(.target.group=="source.toolkit.fluxcd.io" and .target.version=="v1" and .target.kind=="GitRepository")] | length'
+        if [[ "$(yq e "${REPOS_DEPLOYED_EXPR}" "${ENVIRONMENT_KUSTOMIZATION_FILE}")" == "0" ]]; then
+          git rm -rfv "${ENVIRONMENT_DIRECTORY}"
+        fi
+        
+        # Remove this repository from the list of repositories monitored by the Flux webhook receiver (if it's there)
+        yq e -i '.spec.resources -= [{"kind": "GitRepository","name":env(REPOSITORY),"namespace":env(ENVIRONMENT)}]' platform/flux-webhook/receiver.yaml
+        git add platform/flux-webhook/receiver.yaml
+        
+        # Push changes to delivery repository
+        git config user.name "github-actions"
+        git config user.email "github-actions@github.com"
+        if [[ -n "$(git status -s --untracked-files=no)" ]]; then
+          git commit -m "deploy(${REPOSITORY}): undeploy from \"${ENVIRONMENT}\"" --signoff
+          git push origin HEAD
+        fi
